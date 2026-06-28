@@ -719,7 +719,7 @@ function Dashboard({ records, analista, isAdmin }) {
 
 // ─── APP ROOT ─────────────────────────────────────────────────────────────────
 
-export default function App() {
+function App() {
   const [state, setState]       = useState(()=>loadState());
   const [user, setUser]         = useState(null); // { name, isAdmin }
   const [loginName, setLN]      = useState("");
