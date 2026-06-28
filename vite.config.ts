@@ -9,8 +9,8 @@ export default defineConfig({
     TanStackRouterVite({ routesDirectory: "./src/routes", generatedRouteTree: "./src/routeTree.gen.ts" }),
     react(),
   ],
-  css: {
-    transformer: "postcss",
+  build: {
+    cssMinify: "esbuild",
   },
   resolve: {
     alias: {
