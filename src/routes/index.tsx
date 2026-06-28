@@ -713,7 +713,7 @@ function Dashboard({ records }) {
 
 // ─── APP ROOT ─────────────────────────────────────────────────────────────────
 
-export default function App() {
+function App() {
   const [state, setState]       = useState(() => loadState());
   const [view, setView]         = useState("login");
   const [analista, setAnalista] = useState("");
