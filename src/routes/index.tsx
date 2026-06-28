@@ -1,16 +1,8 @@
 // @ts-nocheck
 import { createFileRoute } from "@tanstack/react-router";
-export const Route = createFileRoute("/")({
-  head: () => ({
-    meta: [
-      { title: "Controle de Faturamento — Grupo Fcamara" },
-      { name: "description", content: "Controle de faturamento por analista, empresa e PEP." },
-    ],
-  }),
-  component: App,
-});
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
+import * as XLSX from "xlsx";
 
 // ─── CONSTANTS ────────────────────────────────────────────────────────────────
 
@@ -248,42 +240,183 @@ function TimelineModal({ record, onSave, onClose }) {
 
 // ─── IMPORT MODAL (admin only) ───────────────────────────────────────────────
 
-function ImportModal({ onImport, onClose }) {
-  const [text, setText]           = useState("");
-  const [competencia, setComp]    = useState("");
-  const [empresa, setEmpresa]     = useState("BR02");
-  const [tipo, setTipo]           = useState("Time & Expenses");
-  const [mode, setMode]           = useState("add");     // "add" | "replace"
-  const [note, setNote]           = useState("");
-  const [preview, setPreview]     = useState(null);
-  const [msg, setMsg]             = useState("");
+// Cabeçalhos exatos da aba "📥 Time & Expenses" da planilha BASE_MESTRA_FATURAMENTO
+// Mapeamento: chave interna → nome da coluna no Excel (case-insensitive, trim)
+const TE_COL_MAP = {
+  responsavel:  ["RESPONSÁVEL", "RESPONSAVEL"],
+  codCliente:   ["COD CLIENTE"],
+  cliente:      ["NOME CLIENTE"],
+  pep:          ["PEP"],
+  inicio:       ["INICIO", "INÍCIO"],
+  fim:          ["FIM"],
+  profissional: ["PROFISSIONAL"],
+  valorVenda:   ["VALOR DE VENDA"],
+  hrsAprovadas: ["HRS APROVADAS"],
+  valorTotal:   ["VALOR TOTAL"],
+  valorLiquido: ["Valor Liquido :)", "VALOR LIQUIDO", "Valor Liquido"],
+};
 
-  function parse() {
-    if (!competencia.match(/^\d{2}\/\d{4}$/)) { setMsg("Informe a competência no formato MM/AAAA."); return; }
-    if (!text.trim()) { setMsg("Cole os dados antes de processar."); return; }
-    const lines = text.trim().split("\n").filter(l => l.trim());
-    const records = [];
-    lines.slice(1).forEach(line => {
-      const c = line.split("\t");
-      if (c.length < 13) return;
-      const responsavel  = (c[0]  || "").trim();
-      const codCliente   = (c[3]  || "").trim();
-      const cliente      = (c[4]  || "").trim();
-      const pep          = (c[5]  || "").trim();
-      const inicio       = (c[6]  || "").trim();
-      const fim          = (c[7]  || "").trim();
-      const profissional = (c[10] || "").trim();
-      const valorVenda   = parseFloat((c[11] || "0").replace(",", ".")) || 0;
-      const hrsAprovadas = parseFloat((c[12] || "0").replace(",", ".")) || 0;
-      const valorTotal   = parseFloat((c[13] || "0").replace(",", ".")) || 0;
-      const valorLiquido = parseFloat((c[14] || "0").replace(",", ".")) || 0;
-      if (!cliente || !pep) return;
-      records.push({ id: genId(), responsavel, empresa, tipo, codCliente, cliente, pep, inicio, fim, profissional, valorVenda, hrsAprovadas, valorTotal, valorLiquido, competencia, progress: makeProgress(), nfFile: null, obs: "", updatedAt: nowISO() });
-    });
-    if (records.length === 0) { setMsg("Nenhum registro válido. Verifique o formato."); return; }
-    setPreview(records);
-    setMsg("");
+function excelDateToStr(val) {
+  // SheetJS retorna datas numéricas do Excel como número serial
+  if (typeof val === "number") {
+    const date = XLSX.SSF.parse_date_code(val);
+    if (date) {
+      const d = String(date.d).padStart(2, "0");
+      const m = String(date.m).padStart(2, "0");
+      return `${d}/${m}/${date.y}`;
+    }
   }
+  if (typeof val === "string" && val.trim()) return val.trim();
+  return "";
+}
+
+function findCol(headers, candidates) {
+  const norm = h => (h || "").toString().trim().toUpperCase().replace(/\s+/g, " ");
+  for (const c of candidates) {
+    const idx = headers.findIndex(h => norm(h) === norm(c));
+    if (idx !== -1) return idx;
+  }
+  return -1;
+}
+
+function parseSheetRows(rows, empresa, tipo, competencia) {
+  if (rows.length < 2) return { records: [], errors: ["Planilha vazia ou sem dados."] };
+
+  // Linha 0 pode ser título decorativo — procura a linha com os cabeçalhos reais
+  let headerRowIdx = 0;
+  for (let i = 0; i < Math.min(5, rows.length); i++) {
+    const row = rows[i];
+    if (row.some(c => (c || "").toString().toUpperCase().includes("RESPONSÁVEL") || (c || "").toString().toUpperCase().includes("RESPONSAVEL"))) {
+      headerRowIdx = i;
+      break;
+    }
+  }
+
+  const headers = rows[headerRowIdx].map(h => (h || "").toString());
+  const colIdx  = {};
+  const missing = [];
+
+  for (const [key, candidates] of Object.entries(TE_COL_MAP)) {
+    const idx = findCol(headers, candidates);
+    if (idx === -1) missing.push(candidates[0]);
+    else colIdx[key] = idx;
+  }
+
+  if (missing.length > 3) {
+    return { records: [], errors: [`Cabeçalhos não encontrados: ${missing.join(", ")}. Verifique se está usando a aba "📥 Time & Expenses".`] };
+  }
+
+  const records = [];
+  const skipped = [];
+
+  for (let i = headerRowIdx + 1; i < rows.length; i++) {
+    const row = rows[i];
+    if (!row || row.every(c => c == null || c === "")) continue;
+
+    const get    = (key) => colIdx[key] != null ? (row[colIdx[key]] ?? "") : "";
+    const getNum = (key) => { const v = get(key); return parseFloat(String(v).replace(",", ".")) || 0; };
+    const getStr = (key) => String(get(key)).trim();
+
+    const cliente      = getStr("cliente");
+    const pep          = getStr("pep");
+    const responsavel  = getStr("responsavel");
+
+    if (!cliente || !pep || !responsavel) { skipped.push(i + 1); continue; }
+
+    records.push({
+      id:           genId(),
+      responsavel,
+      empresa,
+      tipo,
+      codCliente:   getStr("codCliente"),
+      cliente,
+      pep,
+      inicio:       excelDateToStr(get("inicio")),
+      fim:          excelDateToStr(get("fim")),
+      profissional: getStr("profissional"),
+      valorVenda:   getNum("valorVenda"),
+      hrsAprovadas: getNum("hrsAprovadas"),
+      valorTotal:   getNum("valorTotal"),
+      valorLiquido: getNum("valorLiquido"),
+      competencia,
+      progress:     makeProgress(),
+      nfFile:       null,
+      obs:          "",
+      updatedAt:    nowISO(),
+    });
+  }
+
+  const errors = [];
+  if (skipped.length > 0) errors.push(`${skipped.length} linhas ignoradas por falta de cliente/PEP/responsável (linhas: ${skipped.slice(0, 5).join(", ")}${skipped.length > 5 ? "..." : ""}).`);
+
+  return { records, errors };
+}
+
+function ImportModal({ onImport, onClose }) {
+  const [competencia, setComp]  = useState("");
+  const [empresa, setEmpresa]   = useState("BR02");
+  const [tipo, setTipo]         = useState("Time & Expenses");
+  const [mode, setMode]         = useState("add");
+  const [note, setNote]         = useState("");
+  const [preview, setPreview]   = useState(null);
+  const [fileName, setFileName] = useState("");
+  const [msgs, setMsgs]         = useState([]);
+  const [loading, setLoading]   = useState(false);
+  const [dragOver, setDragOver] = useState(false);
+  const fileRef = useRef();
+
+  function reset() { setPreview(null); setFileName(""); setMsgs([]); }
+
+  function readFile(file) {
+    if (!competencia.match(/^\d{2}\/\d{4}$/)) { setMsgs([{ type: "error", text: "Informe a competência no formato MM/AAAA antes de selecionar o arquivo." }]); return; }
+    if (!file) return;
+    const allowed = [".xlsx", ".xlsm", ".xls", ".csv"];
+    const ext = file.name.slice(file.name.lastIndexOf(".")).toLowerCase();
+    if (!allowed.includes(ext)) { setMsgs([{ type: "error", text: `Formato não suportado: ${ext}. Use .xlsx, .xlsm ou .xls.` }]); return; }
+
+    setLoading(true);
+    setFileName(file.name);
+    setPreview(null);
+    setMsgs([]);
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const data = new Uint8Array(e.target.result);
+        const wb   = XLSX.read(data, { type: "array", cellDates: false });
+
+        // Procura aba Time & Expenses (aceita nomes com ou sem emoji)
+        const sheetName = wb.SheetNames.find(n =>
+          n.toLowerCase().includes("time") && n.toLowerCase().includes("expense")
+        ) || wb.SheetNames.find(n => n.toLowerCase().includes("time")) || wb.SheetNames[0];
+
+        const ws   = wb.Sheets[sheetName];
+        const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
+        const { records, errors } = parseSheetRows(rows, empresa, tipo, competencia);
+
+        const newMsgs = [];
+        if (errors.length) errors.forEach(e => newMsgs.push({ type: "warn", text: e }));
+        if (records.length === 0) {
+          newMsgs.push({ type: "error", text: "Nenhum registro válido encontrado. Verifique se o arquivo contém a aba '📥 Time & Expenses' com os cabeçalhos corretos." });
+          setMsgs(newMsgs);
+        } else {
+          newMsgs.push({ type: "ok", text: `${records.length} registros encontrados na aba "${sheetName}".` });
+          setMsgs(newMsgs);
+          setPreview(records);
+        }
+      } catch (err) {
+        setMsgs([{ type: "error", text: "Erro ao ler o arquivo: " + err.message }]);
+      }
+      setLoading(false);
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  const onDrop = useCallback(e => {
+    e.preventDefault(); setDragOver(false);
+    const file = e.dataTransfer.files[0];
+    if (file) readFile(file);
+  }, [competencia, empresa, tipo]);
 
   function confirm() {
     if (!preview) return;
@@ -291,38 +424,43 @@ function ImportModal({ onImport, onClose }) {
     onClose();
   }
 
+  const msgColors = { ok: { bg: "#f0fdf4", text: "#166534", border: "#86efac" }, warn: { bg: "#fffbeb", text: "#92400e", border: "#fde68a" }, error: { bg: "#fef2f2", text: "#991b1b", border: "#fca5a5" } };
+
   return (
-    <Modal title="Importar base de dados" onClose={onClose} wide>
+    <Modal title="Importar base — Time & Expenses" onClose={onClose} wide>
       <div style={{ background: "#fffbeb", border: "1px solid #fde68a", borderRadius: 8, padding: "10px 14px", marginBottom: 16, fontSize: 12, color: "#92400e" }}>
-        🔒 Apenas a Daniela pode importar dados. Esta operação ficará registrada no histórico.
+        🔒 Apenas a Daniela pode importar. Aceita o arquivo <strong>.xlsm / .xlsx</strong> exatamente como exportado — lê a aba <strong>📥 Time & Expenses</strong> com os cabeçalhos originais.
       </div>
 
+      {/* Campos de contexto */}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 14 }}>
         <div>
-          <label style={{ fontSize: 12, color: "#6b7280", display: "block", marginBottom: 4 }}>Competência *</label>
-          <input style={inp} placeholder="05/2026" value={competencia} onChange={e => setComp(e.target.value)} />
+          <label style={{ fontSize: 12, color: "#6b7280", display: "block", marginBottom: 4 }}>Competência * <span style={{ color: "#dc2626" }}>(preencha antes de carregar)</span></label>
+          <input style={inp} placeholder="05/2026" value={competencia} onChange={e => { setComp(e.target.value); reset(); }} />
         </div>
         <div>
           <label style={{ fontSize: 12, color: "#6b7280", display: "block", marginBottom: 4 }}>Empresa</label>
-          <select style={inp} value={empresa} onChange={e => setEmpresa(e.target.value)}>
+          <select style={inp} value={empresa} onChange={e => { setEmpresa(e.target.value); reset(); }}>
             {EMPRESAS.map(e => <option key={e.cod} value={e.cod}>{e.cod} — {e.nome}</option>)}
           </select>
         </div>
         <div>
           <label style={{ fontSize: 12, color: "#6b7280", display: "block", marginBottom: 4 }}>Tipo de projeto</label>
-          <select style={inp} value={tipo} onChange={e => setTipo(e.target.value)}>
+          <select style={inp} value={tipo} onChange={e => { setTipo(e.target.value); reset(); }}>
             {TIPOS_PROJETO.map(t => <option key={t}>{t}</option>)}
           </select>
         </div>
       </div>
 
+      {/* Modo */}
       <div style={{ marginBottom: 14 }}>
-        <label style={{ fontSize: 12, color: "#6b7280", display: "block", marginBottom: 6 }}>Modo de importação *</label>
+        <label style={{ fontSize: 12, color: "#6b7280", display: "block", marginBottom: 6 }}>Modo de importação</label>
         <div style={{ display: "flex", gap: 10 }}>
-          {[{ v: "add", l: "➕ Incluir novos registros", d: "Adiciona os registros sem apagar os existentes desta competência." },
-            { v: "replace", l: "🔄 Substituir competência", d: "Remove TODOS os registros desta competência/empresa/tipo antes de importar." }
+          {[
+            { v: "add",     l: "➕ Incluir novos",       d: "Adiciona sem apagar registros existentes desta competência." },
+            { v: "replace", l: "🔄 Substituir completo", d: "Remove TODOS desta competência/empresa/tipo e reimporta." },
           ].map(opt => (
-            <label key={opt.v} style={{ flex: 1, display: "flex", gap: 10, padding: "10px 14px", borderRadius: 8, border: `2px solid ${mode === opt.v ? "#1d4ed8" : "#e5e7eb"}`, cursor: "pointer", background: mode === opt.v ? "#eff6ff" : "#fff" }}>
+            <label key={opt.v} style={{ flex: 1, display: "flex", gap: 8, padding: "10px 12px", borderRadius: 8, border: `2px solid ${mode === opt.v ? "#1d4ed8" : "#e5e7eb"}`, cursor: "pointer", background: mode === opt.v ? "#eff6ff" : "#fff" }}>
               <input type="radio" name="mode" value={opt.v} checked={mode === opt.v} onChange={() => setMode(opt.v)} style={{ marginTop: 2 }} />
               <div>
                 <div style={{ fontSize: 13, fontWeight: 700, color: mode === opt.v ? "#1d4ed8" : "#374151" }}>{opt.l}</div>
@@ -331,36 +469,98 @@ function ImportModal({ onImport, onClose }) {
             </label>
           ))}
         </div>
+        {mode === "replace" && <div style={{ marginTop: 8, fontSize: 12, color: "#dc2626", fontWeight: 600 }}>⚠ O progresso dos passos já registrado para esta competência será perdido.</div>}
       </div>
 
+      {/* Nota */}
       <div style={{ marginBottom: 14 }}>
         <label style={{ fontSize: 12, color: "#6b7280", display: "block", marginBottom: 4 }}>Nota da importação (opcional)</label>
-        <input style={inp} placeholder="Ex: Ajuste de valores do mês de maio" value={note} onChange={e => setNote(e.target.value)} />
+        <input style={inp} placeholder="Ex: Ajuste de valores de maio" value={note} onChange={e => setNote(e.target.value)} />
       </div>
 
-      <label style={{ fontSize: 12, color: "#6b7280", display: "block", marginBottom: 4 }}>
-        Dados do Excel (cole com cabeçalho — colunas: RESPONSÁVEL, TIPO, EMPRESA, COD CLIENTE, NOME CLIENTE, PEP, INICIO, FIM, NUM PESSOAL, BRCPF, PROFISSIONAL, VALOR DE VENDA, HRS APROVADAS, VALOR TOTAL, Valor Liquido)
-      </label>
-      <textarea value={text} onChange={e => { setText(e.target.value); setPreview(null); }} placeholder="Cole aqui os dados copiados do Excel..." style={{ ...inp, minHeight: 150, resize: "vertical", fontFamily: "monospace", fontSize: 11 }} />
+      {/* Drop zone */}
+      <input type="file" ref={fileRef} style={{ display: "none" }} accept=".xlsx,.xlsm,.xls,.csv"
+        onChange={e => { if (e.target.files[0]) readFile(e.target.files[0]); e.target.value = ""; }} />
 
-      {msg && <div style={{ marginTop: 8, fontSize: 13, padding: "8px 12px", borderRadius: 8, background: "#fef2f2", color: "#991b1b" }}>{msg}</div>}
+      <div
+        onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={onDrop}
+        onClick={() => fileRef.current.click()}
+        style={{
+          border: `2px dashed ${dragOver ? "#1d4ed8" : fileName ? "#86efac" : "#d1d5db"}`,
+          borderRadius: 10, padding: "28px 20px", textAlign: "center",
+          cursor: "pointer", background: dragOver ? "#eff6ff" : fileName ? "#f0fdf4" : "#fafafa",
+          transition: "all .2s", marginBottom: 14,
+        }}
+      >
+        {loading ? (
+          <div style={{ color: "#6b7280", fontSize: 13 }}>⏳ Lendo arquivo...</div>
+        ) : fileName ? (
+          <>
+            <div style={{ fontSize: 24, marginBottom: 6 }}>✅</div>
+            <div style={{ fontSize: 13, fontWeight: 700, color: "#166534" }}>{fileName}</div>
+            <div style={{ fontSize: 11, color: "#9ca3af", marginTop: 4 }}>Clique para trocar o arquivo</div>
+          </>
+        ) : (
+          <>
+            <div style={{ fontSize: 28, marginBottom: 8 }}>📂</div>
+            <div style={{ fontSize: 14, fontWeight: 600, color: "#374151" }}>Clique ou arraste o arquivo aqui</div>
+            <div style={{ fontSize: 12, color: "#9ca3af", marginTop: 4 }}>Aceita .xlsm e .xlsx — lê automaticamente a aba <strong>📥 Time & Expenses</strong></div>
+          </>
+        )}
+      </div>
 
+      {/* Cabeçalhos esperados */}
+      <div style={{ marginBottom: 14, padding: "10px 12px", borderRadius: 8, background: "#f8fafc", border: "1px solid #e5e7eb" }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: "#6b7280", marginBottom: 6 }}>CABEÇALHOS LIDOS DA ABA TIME & EXPENSES:</div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+          {["RESPONSÁVEL","COD CLIENTE","NOME CLIENTE","PEP","INICIO","FIM","PROFISSIONAL","VALOR DE VENDA","HRS APROVADAS","VALOR TOTAL","Valor Liquido :)"].map(h => (
+            <span key={h} style={{ fontSize: 10, padding: "2px 7px", borderRadius: 4, background: "#e0f2fe", color: "#0369a1", fontFamily: "monospace" }}>{h}</span>
+          ))}
+        </div>
+      </div>
+
+      {/* Mensagens */}
+      {msgs.map((m, i) => (
+        <div key={i} style={{ marginBottom: 6, fontSize: 12, padding: "8px 12px", borderRadius: 8, background: msgColors[m.type].bg, color: msgColors[m.type].text, border: `1px solid ${msgColors[m.type].border}` }}>
+          {m.text}
+        </div>
+      ))}
+
+      {/* Preview */}
       {preview && (
-        <div style={{ marginTop: 12, padding: "12px 14px", borderRadius: 8, background: "#f0fdf4", border: "1px solid #86efac" }}>
-          <div style={{ fontSize: 13, fontWeight: 700, color: "#166534", marginBottom: 4 }}>✓ {preview.length} registros prontos para importar</div>
-          <div style={{ fontSize: 12, color: "#166534" }}>
-            {mode === "replace" ? `Os registros existentes de ${competencia} / ${empresa} / ${tipo} serão substituídos.` : `${preview.length} novos registros serão adicionados.`}
+        <div style={{ marginBottom: 14, padding: "12px 14px", borderRadius: 8, background: "#f0fdf4", border: "1px solid #86efac" }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: "#166534", marginBottom: 6 }}>✓ {preview.length} registros prontos para importar</div>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+              <thead><tr style={{ background: "#dcfce7" }}>
+                {["Responsável","Cliente","PEP","Profissional","Val. Total"].map(h =>
+                  <th key={h} style={{ padding: "4px 8px", textAlign: "left", color: "#166534", fontWeight: 700 }}>{h}</th>
+                )}
+              </tr></thead>
+              <tbody>
+                {preview.slice(0, 5).map(r => (
+                  <tr key={r.id}>
+                    <td style={{ padding: "4px 8px" }}>{r.responsavel}</td>
+                    <td style={{ padding: "4px 8px" }}>{r.cliente}</td>
+                    <td style={{ padding: "4px 8px", fontFamily: "monospace" }}>{r.pep}</td>
+                    <td style={{ padding: "4px 8px" }}>{r.profissional}</td>
+                    <td style={{ padding: "4px 8px" }}>{fmtShort(r.valorTotal)}</td>
+                  </tr>
+                ))}
+                {preview.length > 5 && <tr><td colSpan={5} style={{ padding: "4px 8px", color: "#9ca3af", fontStyle: "italic" }}>... e mais {preview.length - 5} registros</td></tr>}
+              </tbody>
+            </table>
           </div>
-          {mode === "replace" && <div style={{ fontSize: 12, color: "#dc2626", marginTop: 4, fontWeight: 600 }}>⚠ O progresso (passos) dos registros substituídos será perdido.</div>}
         </div>
       )}
 
-      <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 16 }}>
+      <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
         <Btn onClick={onClose}>Cancelar</Btn>
-        {!preview
-          ? <Btn primary onClick={parse}>Analisar dados</Btn>
-          : <Btn primary onClick={confirm}>{mode === "replace" ? "⚠ Confirmar substituição" : "✓ Confirmar importação"}</Btn>
-        }
+        <Btn primary onClick={confirm} disabled={!preview}>
+          {mode === "replace" ? "⚠ Confirmar substituição" : "✓ Confirmar importação"}
+        </Btn>
       </div>
     </Modal>
   );
@@ -848,3 +1048,9 @@ function App() {
     </div>
   );
 }
+
+
+export const Route = createFileRoute("/")({
+  head: () => ({ meta: [{ title: "FCamara Billing" }] }),
+  component: App,
+});
